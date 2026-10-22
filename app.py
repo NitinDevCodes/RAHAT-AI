@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import unicodedata
 import hmac
 import hashlib
 import secrets
@@ -40,7 +41,7 @@ if not api_key:
     st.error("⚠️ GEMINI_API_KEY not found! Please create a `.env` file and add your key.")
     st.stop()
 
-client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=60_000))   # milliseconds: a stuck request fails after 60 s
 
 def get_secret(name):
     """Read a setting from the .env file (local) or Streamlit secrets (hosted)."""
@@ -63,6 +64,8 @@ def gen(**kwargs):
         except Exception as e:
             last = e
             msg = str(e).lower()
+            if "per day" in msg or "daily" in msg:   # daily free quota used up: retrying cannot help
+                raise RuntimeError("The daily free AI limit has been reached. Please try again later.") from e
             if any(k in msg for k in ("429", "503", "500", "unavailable", "overloaded", "resource_exhausted", "quota")):
                 time.sleep(2 * (attempt + 1))
                 continue
@@ -204,7 +207,8 @@ def init_db():
                 people_count INTEGER, people_text TEXT, resources TEXT,
                 summary TEXT, language TEXT, image_path TEXT, is_demo INTEGER DEFAULT 0
             )""")
-        for col in ("credibility TEXT", "credibility_note TEXT", "transcript TEXT", "status TEXT DEFAULT 'New'", "status_updated_at TEXT", "tracking_code TEXT", "prev_status TEXT", "prev_status_updated_at TEXT"):   # adds new columns to an older reports.db
+        for col in ("credibility TEXT", "credibility_note TEXT", "transcript TEXT", "status TEXT DEFAULT 'New'", "status_updated_at TEXT", "tracking_code TEXT", "prev_status TEXT", "prev_status_updated_at TEXT",
+                    "report_text TEXT", "audio_path TEXT", "audio_mime TEXT", "ai_status TEXT", "ai_error TEXT", "ai_attempted_at TEXT"):   # adds new columns to an older reports.db
             try:
                 con.execute(f"ALTER TABLE reports ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -232,7 +236,8 @@ def normalize_code(raw: str):
 def save_report(r: dict):
     """Saves a report and returns its tracking code (citizen reports only; demo reports get none)."""
     r = {"credibility": "Not checked", "credibility_note": "", "transcript": "", "status": "New", "status_updated_at": None,
-         "tracking_code": None, **r}
+         "tracking_code": None, "report_text": "", "audio_path": "", "audio_mime": "", "ai_status": None, "ai_error": None,
+         "ai_attempted_at": None, **r}
     if r["tracking_code"] is None and not r.get("is_demo"):
         r["tracking_code"] = new_tracking_code()
     for _ in range(5):
@@ -241,10 +246,12 @@ def save_report(r: dict):
                 con.execute("""
                     INSERT INTO reports (created_at, location, lat, lon, hazard_type, severity, severity_reason,
                                          people_count, people_text, resources, summary, language, image_path, is_demo,
-                                         credibility, credibility_note, transcript, status, status_updated_at, tracking_code)
+                                         credibility, credibility_note, transcript, status, status_updated_at, tracking_code,
+                                         report_text, audio_path, audio_mime, ai_status, ai_error, ai_attempted_at)
                     VALUES (:created_at, :location, :lat, :lon, :hazard_type, :severity, :severity_reason,
                             :people_count, :people_text, :resources, :summary, :language, :image_path, :is_demo,
-                            :credibility, :credibility_note, :transcript, :status, :status_updated_at, :tracking_code)""", r)
+                            :credibility, :credibility_note, :transcript, :status, :status_updated_at, :tracking_code,
+                            :report_text, :audio_path, :audio_mime, :ai_status, :ai_error, :ai_attempted_at)""", r)
             return r["tracking_code"]
         except sqlite3.IntegrityError:   # the code already exists (extremely unlikely): make another one
             if r["tracking_code"] is None:
@@ -489,6 +496,235 @@ def save_photo(image: Image.Image) -> str:
     img.save(path, quality=85)
     return path
 
+AUDIO_EXT = {mime: ext for ext, mime in AUDIO_MIME.items()}
+
+def save_audio(data: bytes, mime: str) -> str:
+    path = os.path.join(UPLOAD_DIR, f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{AUDIO_EXT.get(mime, 'wav')}")
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+PENDING_SEVERITY = 4   # placeholder for an unassessed report: the existing rules keep severity 4 at Medium priority or higher
+AI_REASON = {"daily quota": "the free daily AI limit has been reached", "rate limit": "the AI service is busy right now",
+             "timeout": "the AI service took too long to respond", "service unavailable": "the AI service is temporarily unavailable",
+             "other error": "the AI service could not process this report"}
+
+def ai_error_kind(exc) -> str:
+    """Short, safe category for a failed Gemini call (never the raw error text)."""
+    text, e = "", exc
+    for _ in range(4):   # gen() wraps the original error, so look at the whole chain
+        if e is None:
+            break
+        text += f" {type(e).__name__} {e}".lower()
+        e = e.__cause__
+    if "daily" in text or "per day" in text:
+        return "daily quota"
+    if "timeout" in text or "timed out" in text or "deadline" in text:
+        return "timeout"
+    if any(k in text for k in ("503", "502", "504", "unavailable", "overloaded", "internal")):
+        return "service unavailable"
+    if any(k in text for k in ("429", "resource_exhausted", "rate limit", "quota", "free-tier", "busy")):
+        return "rate limit"
+    return "other error"
+
+# ---------------------------------------------------------
+# 6e. Basic emergency keyword check. Used ONLY while an AI assessment is Pending (Gemini failed).
+#     Simple, explainable rules: no AI, no dispatching. A match raises the report to High for urgent HUMAN review.
+# ---------------------------------------------------------
+FLAGGED_SEVERITY = 5   # a keyword match uses the existing rule "severity 5 = High"; it can raise a priority, never lower it
+_DB, _DA = "(?<![\u0900-\u097f])", "(?![\u0900-\u097f])"   # word edges for Devanagari (\b does not work well with it)
+# (label, [(pattern, negatable)]).  negatable=False for pleas and requests ("bachao", "help us", "ambulance"), which are never cancelled.
+EMERGENCY_RULES = [
+    ("fire", [
+        (r"\bfire\b", True), (r"\b(on fire|burning|burnt|blaze|flames?)\b", True), (r"\baag(h)?\b", True),
+        (r"\bjal\s+(raha|rahi|rahe|gaya|gayi)\b", True), (_DB + "आग" + _DA, True), (r"जल\s*रह[ाीे]", True), ("लपट", True),
+        (r"\bfire\s+(brigade|engine|truck|tender|department|service)s?\b", False)]),
+    ("people trapped or needing rescue", [
+        (r"\b(trapped|buried|stranded)\b", True),
+        (r"\bstuck\s+(inside|under|in the (building|house|lift|elevator|car|vehicle|water|mud|flood))\b", True),
+        (r"\bunder (the )?(rubble|debris|collapsed|fallen)\b", True), (r"\brescue\b", True),
+        (r"\b(cannot|can't|cant|unable to|not able to) (get out|escape|exit|leave|move|breathe)\b", False),
+        (r"\b(no one|nobody|none of us) (can|could|is able to) (get out|escape|exit|leave|move)\b", False),
+        (r"\b(help us|save us|sos)\b", False), (r"\bphans\w*", True), (r"\bfans(a|e|i)\b", True), (r"\bmalb[ae]\b", True),
+        (r"\b(bachao|bachaao|bacha lo|bachalo)\b", False),
+        (_DB + "फ[ंँ]स", True), ("बचाओ|बचा\\s*लो|बचाइए", False), (_DB + "मलब[ाे]", True)]),
+    ("building or structure collapse", [
+        (r"\bcollaps\w*", True), (r"\bcave[- ]?in\b|\bcaved in\b", True),
+        (r"\b(building|house|home|wall|roof|ceiling|bridge|structure|flyover|tower)\b(?:\s+\w{1,10}){0,2}\s+(fell|fallen|came down|caved in|gave way)\b", True),
+        (r"\b(building|makaan|ghar|imarat|diwar|deewar|dewar|chhat|pul|bridge|wall|roof)\b(?:\s+\w{1,10}){0,2}\s+(gir|gira|giri|gire|girne|dhah|dhaha|dhahi|dhahe|toot|toota|tooti|tut)\w*", True),
+        ("(इमारत|मकान|घर|दीवार|छत|पुल|भवन)(?:\\s+\\S{1,10}){0,1}\\s+(गिर|ढह|टूट)", True), ("ढ\u093cह", True)]),
+    ("serious injury or death", [
+        (r"\b(injur\w*|wounded|bleeding|unconscious|casualt\w*|fatalit\w*|killed|dead|died|dying|deaths?)\b", True),
+        (r"\b(not|stopped|stop) breathing\b", True), (r"\bcritical condition\b|\bheart attack\b|\bbroken (leg|arm|bone|back|neck)\b", True),
+        (r"\bgha+yal\w*", True), (r"\bzakhm\w*", True), (r"\bkhoon\b", True), (r"\bbehosh\w*", True),
+        (r"\bmar\s+(gaya|gayi|gaye|gai)\b", True), (r"\bmaut\w*", True), (r"\bs(aa|a)ns\s+n(ahi|hi)\b", True), (r"\bdam\s+tod\w*", True),
+        ("घायल", True), ("ज\u093c?ख\u093c?्म", True), ("ख\u093c?ून", True), ("बेहोश", True), ("मौत|मृत", True),
+        ("मर\\s*(गया|गई|गये|गए|गयी)", True), ("(साँस|सांस)\\s*नहीं", True), ("दम\\s*तोड़", True),
+        (r"\bambulance\b", False), ("एम्बुलेंस|एंबुलेंस", False)]),
+    ("drowning or being swept away", [
+        (r"\b(drown\w*|swept away|washed away|carried away by (the )?(water|flood|current))\b", True),
+        (r"\b(doob|dub|dhoob)\w*\s+(rahe|raha|rahi|gaye|gaya|gayi)\b", True), (r"\bbeh\s+(gaye|gaya|gayi|rahe|raha|rahi)\b", True),
+        (_DB + "डूब", True), ("बह\\s*(गए|गये|गया|गई|गयी|रहे|रहा|रही)", True)]),
+    ("explosion or gas leak", [
+        (r"\b(explosion|exploded|explode|blast|gas leak\w*|cylinder (blast|burst))\b", True), (r"\b(dhamaka|visfot)\b", True),
+        ("धमाका|विस्फोट", True), ("गैस\\s*(लीक|रिस)", True)]),
+]
+_COMPILED = [(label, [(re.compile(unicodedata.normalize("NFC", p), re.I), neg) for p, neg in pats]) for label, pats in EMERGENCY_RULES]
+_NEG_BEFORE = {"no", "not", "without", "nobody", "none", "zero", "never", "neither", "nor", "nil", "isn't", "aren't", "wasn't", "weren't",
+               "hasn't", "haven't", "didn't", "doesn't", "don't", "isnt", "arent", "wasnt", "hasnt", "didnt", "doesnt", "dont"}
+_NEG_AFTER = {"nahi", "nahin", "nhi", "nahee", "नहीं", "नही", "नहि"}   # Hindi / Hinglish: the "no" comes after the word
+_BENIGN = re.compile(r"\b(?:(?:fire|mock|evacuation|safety) drill|false alarm|fire (?:station|exit|extinguisher|safety|insurance)|dead (?:end|line|lock|battery))\b")
+_CLAUSE_SPLIT = re.compile(r"[.,;:!?\n।|]+|\b(?:but|however|although|though|lekin|magar|parantu)\b|\s(?:लेकिन|मगर|परंतु|किन्तु)\s")
+
+def _tokens(s: str) -> list:
+    return [t.strip(".,;:!?()[]{}\"'…-") for t in s.split()]
+
+def _negated(clause: str, m) -> bool:
+    """'no injuries', 'there is no fire', 'ghayal nahi': a negative word just before (English) or just after (Hindi) the match."""
+    return (any(t in _NEG_BEFORE for t in _tokens(clause[:m.start()])[-3:]) or
+            any(t in _NEG_AFTER for t in _tokens(clause[m.end():])[:2]))
+
+def emergency_flags(*texts) -> list:
+    """Emergency types clearly mentioned and not negated: [{'label', 'match'}]. Empty list = nothing obvious found."""
+    text = " ".join(t for t in texts if isinstance(t, str))
+    text = _BENIGN.sub(" ", unicodedata.normalize("NFC", text).replace("\u2019", "'").lower())
+    clauses = _CLAUSE_SPLIT.split(text)
+    found = []
+    for label, patterns in _COMPILED:
+        hit = None
+        for clause in clauses:
+            for rx, negatable in patterns:
+                for m in rx.finditer(clause):
+                    if not (negatable and _negated(clause, m)):
+                        hit = m.group(0).strip()
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        if hit:
+            found.append({"label": label, "match": hit[:30]})
+    return found
+
+def apply_emergency_flag(code: str, flags: list, severity: int = FLAGGED_SEVERITY) -> bool:
+    """Flags a report that is STILL PENDING for urgent human review. Raises severity (never lowers it) and records why.
+    ai_status stays 'Pending' and the incident status is untouched: nothing is dispatched automatically."""
+    reason = ("URGENT HUMAN REVIEW. A simple keyword check (NOT an AI assessment) found: "
+              + "; ".join(f"{f['label']} (\"{f['match']}\")" for f in flags) + ". The AI assessment is still pending.")
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("UPDATE reports SET severity = MAX(COALESCE(severity, 0), ?), severity_reason = ? "
+                          "WHERE tracking_code = ? AND ai_status = 'Pending'", (severity, reason, code))
+    return cur.rowcount > 0
+# (end of emergency check)
+
+def mark_ai_pending(code: str, kind: str):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE reports SET ai_status = 'Pending', ai_error = ?, ai_attempted_at = ? WHERE tracking_code = ?",
+                    (kind, datetime.now().isoformat(), code))
+
+def complete_assessment(code: str, data: dict):
+    """Writes Gemini's assessment into the SAME report (found by its tracking code)."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("""UPDATE reports SET hazard_type = ?, severity = ?, severity_reason = ?, people_count = ?, people_text = ?,
+                       resources = ?, summary = ?, language = ?, credibility = ?, credibility_note = ?, transcript = ?,
+                       ai_status = 'Completed', ai_error = NULL, ai_attempted_at = ? WHERE tracking_code = ? AND ai_status = 'Pending'""",
+                    (data.get("hazard_type", "Unknown"), int(data.get("severity", 1)), data.get("severity_reason", ""),
+                     int(data.get("people_at_risk_count", UNKNOWN_PEOPLE)), data.get("people_at_risk", ""),
+                     json.dumps(data.get("resources_needed", []) or []), data.get("english_summary", ""),
+                     data.get("language_detected", ""), data.get("photo_report_match", "Not checked"),
+                     data.get("credibility_note", ""), data.get("voice_transcript", "") or "", datetime.now().isoformat(), code))
+    return cur.rowcount > 0   # False = the report was no longer pending (already assessed), so nothing was changed
+
+def intake_report(image, audio, location: str, report_text: str, coords):
+    """SAVE FIRST, ASSESS SECOND. Returns (tracking_code, Gemini data or None, error kind or None).
+    The report (text, location, photo, voice note, tracking code) is stored before Gemini is called, so a Gemini
+    failure can never lose it: the report simply stays 'Pending'."""
+    image_path, audio_path, audio_mime = "", "", ""
+    if image is not None:
+        try:
+            image_path = save_photo(image)
+        except Exception:
+            log.exception("Could not save the photo")
+    if audio is not None:
+        try:
+            audio_path, audio_mime = save_audio(audio[0], audio[1]), audio[1]
+        except Exception:
+            log.exception("Could not save the voice note")
+    try:
+        code = save_report(dict(
+            created_at=datetime.now().isoformat(), location=location, lat=coords[0] if coords else None, lon=coords[1] if coords else None,
+            hazard_type="Pending AI assessment", severity=PENDING_SEVERITY,
+            severity_reason="AI assessment pending. The report is saved and held at Medium priority or higher until it has been assessed.",
+            people_count=UNKNOWN_PEOPLE, people_text="Unknown", resources="[]",
+            summary=report_text[:300] if report_text else "Voice note received. AI transcription pending.",
+            language="Pending", image_path=image_path, is_demo=0,
+            credibility="Not checked" if image is not None else "Not provided",
+            credibility_note="AI assessment pending." if image is not None else "No photo was provided.",
+            transcript="", report_text=report_text, audio_path=audio_path, audio_mime=audio_mime, ai_status="Pending"))
+    except Exception as e:
+        log.exception("Could not save the report")
+        raise RuntimeError("We could not save your report. Please try again. If someone is in immediate danger, call 112.") from e
+    try:
+        data = clean_triage(run_triage(image, location, report_text, audio), has_photo=image is not None)
+        complete_assessment(code, data)
+    except Exception as e:
+        log.exception("AI assessment failed; the report stays saved as Pending")
+        kind = ai_error_kind(e)
+        try:
+            mark_ai_pending(code, kind)
+        except Exception:
+            log.exception("Could not record the failure reason")
+        try:   # Gemini failed: look for obvious emergencies in the citizen's own words (the transcript only comes from Gemini, so it is empty here)
+            flags = emergency_flags(report_text, "")
+            if flags:
+                apply_emergency_flag(code, flags)
+        except Exception:
+            log.exception("Emergency keyword check failed")
+        return code, None, kind
+    return code, data, None
+
+def retry_assessment(report_id: int):
+    """AUTHORITY ONLY. Retries the AI assessment of ONE pending report using its SAVED evidence (text, photo, voice note).
+    Updates the same row on success. Never changes the incident status, never dispatches. Returns (ok, message)."""
+    require_authority()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM reports WHERE id = ?", (int(report_id),)).fetchone()
+    if row is None:
+        return False, "That report no longer exists."
+    if row["ai_status"] != "Pending":
+        return False, "This report already has a completed AI assessment."
+    code, text = row["tracking_code"], row["report_text"] or ""
+    image, audio = None, None
+    try:   # reuse the evidence that was saved at submission
+        if row["image_path"]:
+            image = Image.open(row["image_path"])
+            image.load()
+        if row["audio_path"]:
+            with open(row["audio_path"], "rb") as f:
+                audio = (f.read(), row["audio_mime"] or "audio/wav")
+    except Exception:
+        log.exception("Saved evidence could not be read for the retry")
+        return False, "The saved photo or voice note could not be read, so the AI assessment was not retried. The report is unchanged and still pending."
+    try:
+        data = clean_triage(run_triage(image, row["location"], text, audio), has_photo=image is not None)
+    except Exception as e:
+        log.exception("Retry of the AI assessment failed; the report stays Pending")
+        kind = ai_error_kind(e)
+        try:
+            mark_ai_pending(code, kind)   # only records the reason and time: evidence, flags and status are untouched
+        except Exception:
+            log.exception("Could not record the failure reason")
+        return False, f"The AI assessment could not be completed again ({AI_REASON[kind]}). The report is unchanged and still pending."
+    if str(row["severity_reason"] or "").startswith("URGENT HUMAN REVIEW") and data["severity"] < row["severity"]:
+        # never silently lower a keyword-check flag: keep the higher severity and say so
+        data["severity_reason"] += (f" (The AI estimated severity {data['severity']}, but this stays at {row['severity']} because an earlier "
+                                    "keyword check flagged it for urgent human review. A person should confirm.)")
+        data["severity"] = row["severity"]
+    if not complete_assessment(code, data):
+        return False, "This report was assessed by someone else in the meantime, so nothing was changed."
+    return True, "AI assessment completed. The report, its tracking code and its status are unchanged."
+
 # ---------------------------------------------------------
 # 6b. Duplicate merging: several reports of one incident -> ONE incident
 # ---------------------------------------------------------
@@ -525,6 +761,9 @@ def status_of(r) -> str:
 def prev_of(r) -> str:
     v = r.get("prev_status")
     return v if v in STATUS_ORDER else "New"
+
+def is_pending(r) -> bool:
+    return r.get("ai_status") == "Pending"
 
 def cred_of(r) -> str:
     v = r.get("credibility")
@@ -598,7 +837,7 @@ def match_info(a, b) -> dict:
     if shared_road:
         loc = min(40, loc + 6)
     time_pts = 20 if hours <= 1 else 16 if hours <= 3 else 12 if hours <= 6 else 6 if hours <= 12 else 2
-    sim = dice(word_set(a["summary"]), word_set(b["summary"]))
+    sim = 0.0 if (is_pending(a) or is_pending(b)) else dice(word_set(a["summary"]), word_set(b["summary"]))
     text_pts = round(30 * min(1.0, sim / 0.7))
     pa, pb = photo_file(a), photo_file(b)
     dist = None
@@ -610,7 +849,7 @@ def match_info(a, b) -> dict:
     img_similar = dist is not None and dist <= 10
     img_pts = 15 if img_same else 8 if img_similar else 0
     score = min(100, loc + time_pts + text_pts + img_pts)
-    auto = (family not in GENERIC_HAZARDS and hours <= MERGE_AUTO_HOURS and
+    auto = (family not in GENERIC_HAZARDS and not (is_pending(a) or is_pending(b)) and hours <= MERGE_AUTO_HOURS and
             ((close_precise and score >= AUTO_SCORE and (sim >= 0.30 or img_similar)) or (img_same and same_place)))
     reasons = []
     if km is not None:
@@ -1043,6 +1282,28 @@ H("<div class='topbar'><div class='brand'><div class='logo'>R</div><div><div cla
   "<div class='bs'>Rapid Assessment &amp; Help Allocation Tool</div></div></div>"
   "<div class='live'><span class='pulse'></span>LIVE</div></div>")
 
+def saved_confirmation(tracking_code, coords, approx):
+    """Banner that the report is saved + the citizen's tracking code (shown for every saved report)."""
+    if coords:
+        H(banner("ok", "✅ Report saved and sent to the control room." + (" The pin uses the approximate centre of the named place." if approx else "")))
+    else:
+        H(banner("warn", "Report saved, but the location could not be found on the map. "
+                         "Enter latitude/longitude under the optional coordinates box and submit again."))
+
+    # tracking code for the citizen (shown now; also pre-filled in the Track report tab for this visit)
+    st.session_state["track_code_input"] = tracking_code
+    H("<div class='card'><div class='eyebrow'>Your tracking code</div>"
+      f"<div class='trk-code'>{esc(tracking_code)}</div>"
+      "<div class='fn'>Save this code now. Use it in the <b>Track report</b> tab to check the status of your report. "
+      "It is shown only once.</div></div>")
+    st.code(tracking_code, language=None)
+    receipt = (f"RAHAT AI tracking code\n\nCode: {tracking_code}\nSubmitted: {datetime.now(IST).strftime('%d %b %Y, %I:%M %p IST')}\n\n"
+               "To check your report, open RAHAT AI and use the 'Track report' tab.\nIf someone is in immediate danger, call 112.\n")
+    try:
+        st.download_button("Save code as a text file", receipt, file_name=f"{tracking_code}.txt", on_click="ignore", icon=":material/download:")
+    except TypeError:   # older Streamlit versions
+        st.download_button("Save code as a text file", receipt, file_name=f"{tracking_code}.txt")
+
 tab_submit, tab_track, tab_dash = st.tabs(["Submit report", "Track report", "Control room"])
 
 # ---------------- Tab 1: submit a report ----------------
@@ -1114,41 +1375,33 @@ with tab_submit:
             else:
                 record_submit()
                 location, report_text = location.strip()[:200], report_text.strip()[:1500]
+                # location -> coordinates (no Gemini involved; failures are handled inside)
+                approx = False
+                if manual_lat != 0.0 or manual_lon != 0.0:
+                    coords = (manual_lat, manual_lon)
+                else:
+                    coords = geocode(location)
+                    if coords is None:   # online geocoder failed: use the approximate centre of a known place
+                        coords = fallback_place(location)
+                        approx = coords is not None
+
+                # SAVE FIRST (text, location, photo, voice note, tracking code), THEN ask Gemini
+                tracking_code, data, ai_error = None, None, None
                 with st.spinner("Analyzing visual hazards and cross-referencing text..."):
                     try:
-                        data = clean_triage(run_triage(image, location, report_text, audio), has_photo=image is not None)
+                        tracking_code, data, ai_error = intake_report(image, audio, location, report_text, coords)
                     except Exception as e:
-                        log.exception("Triage failed")   # full details stay in the terminal
-                        st.error(str(e) if isinstance(e, RuntimeError) else
-                                 "Sorry, we could not analyse this report right now. Please try again in a moment.")
-                        data = None
+                        st.error(str(e))
+
+                if tracking_code and data is None:   # saved, but the AI assessment could not be completed
+                    H(banner("warn", f"Your report was submitted successfully, but its AI assessment could not be completed ({AI_REASON[ai_error]}). "
+                                     "The control room has your report and will review it. If someone is in immediate danger, call 112."))
+                    saved_confirmation(tracking_code, coords, approx)
 
                 if data:
-                    # location -> coordinates
-                    approx = False
-                    if manual_lat != 0.0 or manual_lon != 0.0:
-                        coords = (manual_lat, manual_lon)
-                    else:
-                        coords = geocode(location)
-                        approx = False
-                        if coords is None:   # online geocoder failed: use the approximate centre of a known place
-                            coords = fallback_place(location)
-                            approx = coords is not None
-
                     sev = int(data.get("severity", 1))
                     people = int(data.get("people_at_risk_count", UNKNOWN_PEOPLE))   # -1 = unknown
                     resources = data.get("resources_needed", []) or []
-
-                    tracking_code = save_report(dict(
-                        created_at=datetime.now().isoformat(), location=location,
-                        lat=coords[0] if coords else None, lon=coords[1] if coords else None,
-                        hazard_type=data.get("hazard_type", "Unknown"), severity=sev,
-                        severity_reason=data.get("severity_reason", ""), people_count=people,
-                        people_text=data.get("people_at_risk", ""), resources=json.dumps(resources),
-                        summary=data.get("english_summary", ""), language=data.get("language_detected", ""),
-                        image_path=save_photo(image) if image is not None else "", is_demo=0,
-                        credibility=data.get("photo_report_match", "Not checked"), credibility_note=data.get("credibility_note", ""),
-                        transcript=data.get("voice_transcript", "") or ""))
 
                     score, pf, wf, cf, level = priority(sev, people, 0)
                     lc = HEX[level]
@@ -1179,25 +1432,7 @@ with tab_submit:
                                   chip("📍 " + location) + chip("Language: " + str(data.get("language_detected", "Unknown"))))
                     H(f"<div class='card'>{body}</div>")
 
-                    if coords:
-                        H(banner("ok", "✅ Report saved and sent to the control room." + (" The pin uses the approximate centre of the named place." if approx else "")))
-                    else:
-                        H(banner("warn", "Report saved, but the location could not be found on the map. "
-                                         "Enter latitude/longitude under the optional coordinates box and submit again."))
-
-                    # tracking code for the citizen (shown now; also pre-filled in the Track report tab for this visit)
-                    st.session_state["track_code_input"] = tracking_code
-                    H("<div class='card'><div class='eyebrow'>Your tracking code</div>"
-                      f"<div class='trk-code'>{esc(tracking_code)}</div>"
-                      "<div class='fn'>Save this code now. Use it in the <b>Track report</b> tab to check the status of your report. "
-                      "It is shown only once.</div></div>")
-                    st.code(tracking_code, language=None)
-                    receipt = (f"RAHAT AI tracking code\n\nCode: {tracking_code}\nSubmitted: {datetime.now(IST).strftime('%d %b %Y, %I:%M %p IST')}\n\n"
-                               "To check your report, open RAHAT AI and use the 'Track report' tab.\nIf someone is in immediate danger, call 112.\n")
-                    try:
-                        st.download_button("Save code as a text file", receipt, file_name=f"{tracking_code}.txt", on_click="ignore", icon=":material/download:")
-                    except TypeError:   # older Streamlit versions
-                        st.download_button("Save code as a text file", receipt, file_name=f"{tracking_code}.txt")
+                    saved_confirmation(tracking_code, coords, approx)
         else:
             H("<div class='empty'><div class='e-ic'>⚡</div><div class='e-t'>Awaiting an incident report</div>"
               "<div class='e-s'>Submit an incident report on the left to see the AI triage analysis here.</div>"
@@ -1444,6 +1679,11 @@ with tab_dash:
                             for m in x["members"])
                         body += field(f"🔗 Merged from {x['n_reports']} reports", f"<ul class='merged'>{items}</ul>")
                     H(body, d2)
+                    for m in x["members"]:   # voice notes whose AI transcription is still pending can be played here
+                        ap = m.get("audio_path")
+                        if is_pending(m) and isinstance(ap, str) and ap and os.path.exists(ap):
+                            d2.caption("Voice note (AI transcription pending)")
+                            d2.audio(ap)
 
                     restore_to = min((prev_of(m) for m in x["members"] if status_of(m) == x["status"]),
                                      key=lambda name: STATUS_ORDER[name], default="New")
@@ -1503,3 +1743,28 @@ with tab_dash:
                         undo_decision(bt["batch"])
                         st.session_state["flash"] = "Decision undone. The reports are evaluated automatically again."
                         st.rerun()
+
+        # reports whose AI assessment is still pending: an authority can retry them one at a time
+        pending = [(m, x) for x in rows for m in x["members"] if is_pending(m)]
+        if pending:
+            H("<div class='sec-h'>Pending AI assessments<small>retry once the AI service is available again</small></div>")
+            with st.expander(f"Reports awaiting AI assessment ({len(pending)})", expanded=True):
+                for m, x in pending:
+                    why = AI_REASON.get(m.get("ai_error") if isinstance(m.get("ai_error"), str) else "", "the assessment has not been completed yet")
+                    tried = f", last tried {ago_text(m['ai_attempted_at'])}" if isinstance(m.get("ai_attempted_at"), str) else ""
+                    evidence = "".join(chip(t) for t, p in (("photo", m.get("image_path")), ("voice note", m.get("audio_path"))) if isinstance(p, str) and p)
+                    flag = chip("flagged by keyword check: urgent human review") if str(m.get("severity_reason") or "").startswith("URGENT HUMAN REVIEW") else ""
+                    c1, c2 = st.columns([4, 1.3], vertical_alignment="center")
+                    H(f"<div class='fv'><b>{esc(m['location'])}</b> · reported {ago_text(m['created_at'])} · incident {esc(x['status'])}</div>"
+                      f"<div class='fn'>{esc(why)}{tried}</div><div>{evidence}{flag}</div>", c1)
+                    if c2.button("Retry AI assessment", key=f"retry_{m['id']}", icon=":material/refresh:", use_container_width=True):
+                        with st.spinner("Asking the AI to assess this report..."):
+                            try:
+                                ok, msg = retry_assessment(m["id"])
+                            except PermissionError:
+                                ok, msg = False, "Your session has ended. Please sign in again."
+                        if ok:
+                            st.session_state["flash"] = msg
+                            st.rerun()
+                        else:
+                            st.warning(msg)
