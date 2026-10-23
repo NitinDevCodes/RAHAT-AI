@@ -55,19 +55,27 @@ def get_secret(name):
 
 IST = timezone(timedelta(hours=5, minutes=30))   # hosted servers run on UTC; used only for times shown on screen
 
+GEMINI_MAX_ATTEMPTS = 3   # the most Gemini calls ONE action can make (the library itself never retries on its own)
+
+def is_daily_quota(text: str) -> bool:
+    """Gemini names its daily quota like 'GenerateRequestsPerDayPerProjectPerModel', so match with or without spaces."""
+    t = text.lower().replace(" ", "").replace("_", "").replace("-", "")
+    return "perday" in t or "daily" in t
+
 def gen(**kwargs):
-    """Call Gemini. Retries on temporary errors (busy / free-tier rate limit), then gives a friendly message."""
+    """Call Gemini. Retries only temporary errors, at most GEMINI_MAX_ATTEMPTS calls in total, then gives a friendly message."""
     last = None
-    for attempt in range(3):
+    for attempt in range(GEMINI_MAX_ATTEMPTS):
         try:
             return client.models.generate_content(**kwargs)
         except Exception as e:
             last = e
             msg = str(e).lower()
-            if "per day" in msg or "daily" in msg:   # daily free quota used up: retrying cannot help
+            if is_daily_quota(msg):   # daily free quota used up: retrying cannot help
                 raise RuntimeError("The daily free AI limit has been reached. Please try again later.") from e
             if any(k in msg for k in ("429", "503", "500", "unavailable", "overloaded", "resource_exhausted", "quota")):
-                time.sleep(2 * (attempt + 1))
+                if attempt < GEMINI_MAX_ATTEMPTS - 1:
+                    time.sleep(2 * (attempt + 1))
                 continue
             raise
     raise RuntimeError("The AI service is busy right now (free-tier limit reached). Please wait about a minute and try again.") from last
@@ -208,7 +216,7 @@ def init_db():
                 summary TEXT, language TEXT, image_path TEXT, is_demo INTEGER DEFAULT 0
             )""")
         for col in ("credibility TEXT", "credibility_note TEXT", "transcript TEXT", "status TEXT DEFAULT 'New'", "status_updated_at TEXT", "tracking_code TEXT", "prev_status TEXT", "prev_status_updated_at TEXT",
-                    "report_text TEXT", "audio_path TEXT", "audio_mime TEXT", "ai_status TEXT", "ai_error TEXT", "ai_attempted_at TEXT"):   # adds new columns to an older reports.db
+                    "report_text TEXT", "audio_path TEXT", "audio_mime TEXT", "ai_status TEXT", "ai_error TEXT", "ai_attempted_at TEXT", "ai_started_at TEXT"):   # adds new columns to an older reports.db
             try:
                 con.execute(f"ALTER TABLE reports ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -237,7 +245,7 @@ def save_report(r: dict):
     """Saves a report and returns its tracking code (citizen reports only; demo reports get none)."""
     r = {"credibility": "Not checked", "credibility_note": "", "transcript": "", "status": "New", "status_updated_at": None,
          "tracking_code": None, "report_text": "", "audio_path": "", "audio_mime": "", "ai_status": None, "ai_error": None,
-         "ai_attempted_at": None, **r}
+         "ai_attempted_at": None, "ai_started_at": None, **r}
     if r["tracking_code"] is None and not r.get("is_demo"):
         r["tracking_code"] = new_tracking_code()
     for _ in range(5):
@@ -247,11 +255,11 @@ def save_report(r: dict):
                     INSERT INTO reports (created_at, location, lat, lon, hazard_type, severity, severity_reason,
                                          people_count, people_text, resources, summary, language, image_path, is_demo,
                                          credibility, credibility_note, transcript, status, status_updated_at, tracking_code,
-                                         report_text, audio_path, audio_mime, ai_status, ai_error, ai_attempted_at)
+                                         report_text, audio_path, audio_mime, ai_status, ai_error, ai_attempted_at, ai_started_at)
                     VALUES (:created_at, :location, :lat, :lon, :hazard_type, :severity, :severity_reason,
                             :people_count, :people_text, :resources, :summary, :language, :image_path, :is_demo,
                             :credibility, :credibility_note, :transcript, :status, :status_updated_at, :tracking_code,
-                            :report_text, :audio_path, :audio_mime, :ai_status, :ai_error, :ai_attempted_at)""", r)
+                            :report_text, :audio_path, :audio_mime, :ai_status, :ai_error, :ai_attempted_at, :ai_started_at)""", r)
             return r["tracking_code"]
         except sqlite3.IntegrityError:   # the code already exists (extremely unlikely): make another one
             if r["tracking_code"] is None:
@@ -517,7 +525,7 @@ def ai_error_kind(exc) -> str:
             break
         text += f" {type(e).__name__} {e}".lower()
         e = e.__cause__
-    if "daily" in text or "per day" in text:
+    if is_daily_quota(text):
         return "daily quota"
     if "timeout" in text or "timed out" in text or "deadline" in text:
         return "timeout"
@@ -617,9 +625,21 @@ def apply_emergency_flag(code: str, flags: list, severity: int = FLAGGED_SEVERIT
     return cur.rowcount > 0
 # (end of emergency check)
 
+AI_LOCK_S = 240   # an attempt that started less than this long ago is treated as still running
+
+def claim_assessment(report_id: int) -> bool:
+    """Marks the start of ONE Gemini attempt for a pending report. False = another attempt is already running
+    (a double-click, a second operator, or the original submission), so no second Gemini call must be made."""
+    now = datetime.now()
+    stale = (now - timedelta(seconds=AI_LOCK_S)).isoformat()   # a crashed attempt does not block the report forever
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("UPDATE reports SET ai_started_at = ? WHERE id = ? AND ai_status = 'Pending' "
+                          "AND (ai_started_at IS NULL OR ai_started_at < ?)", (now.isoformat(), int(report_id), stale))
+    return cur.rowcount > 0
+
 def mark_ai_pending(code: str, kind: str):
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("UPDATE reports SET ai_status = 'Pending', ai_error = ?, ai_attempted_at = ? WHERE tracking_code = ?",
+        con.execute("UPDATE reports SET ai_status = 'Pending', ai_error = ?, ai_attempted_at = ?, ai_started_at = NULL WHERE tracking_code = ?",
                     (kind, datetime.now().isoformat(), code))
 
 def complete_assessment(code: str, data: dict):
@@ -627,7 +647,7 @@ def complete_assessment(code: str, data: dict):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute("""UPDATE reports SET hazard_type = ?, severity = ?, severity_reason = ?, people_count = ?, people_text = ?,
                        resources = ?, summary = ?, language = ?, credibility = ?, credibility_note = ?, transcript = ?,
-                       ai_status = 'Completed', ai_error = NULL, ai_attempted_at = ? WHERE tracking_code = ? AND ai_status = 'Pending'""",
+                       ai_status = 'Completed', ai_error = NULL, ai_attempted_at = ?, ai_started_at = NULL WHERE tracking_code = ? AND ai_status = 'Pending'""",
                     (data.get("hazard_type", "Unknown"), int(data.get("severity", 1)), data.get("severity_reason", ""),
                      int(data.get("people_at_risk_count", UNKNOWN_PEOPLE)), data.get("people_at_risk", ""),
                      json.dumps(data.get("resources_needed", []) or []), data.get("english_summary", ""),
@@ -660,7 +680,7 @@ def intake_report(image, audio, location: str, report_text: str, coords):
             language="Pending", image_path=image_path, is_demo=0,
             credibility="Not checked" if image is not None else "Not provided",
             credibility_note="AI assessment pending." if image is not None else "No photo was provided.",
-            transcript="", report_text=report_text, audio_path=audio_path, audio_mime=audio_mime, ai_status="Pending"))
+            transcript="", report_text=report_text, audio_path=audio_path, audio_mime=audio_mime, ai_status="Pending", ai_started_at=datetime.now().isoformat()))   # the first attempt is running now
     except Exception as e:
         log.exception("Could not save the report")
         raise RuntimeError("We could not save your report. Please try again. If someone is in immediate danger, call 112.") from e
@@ -706,6 +726,8 @@ def retry_assessment(report_id: int):
     except Exception:
         log.exception("Saved evidence could not be read for the retry")
         return False, "The saved photo or voice note could not be read, so the AI assessment was not retried. The report is unchanged and still pending."
+    if not claim_assessment(row["id"]):
+        return False, "An AI assessment of this report is already running. Please wait a moment, then check again."
     try:
         data = clean_triage(run_triage(image, row["location"], text, audio), has_photo=image is not None)
     except Exception as e:
@@ -1071,6 +1093,19 @@ def record_submit():
     with tracker["lock"]:
         tracker["fails"].setdefault("submit:*", []).append(now)
 
+DUPLICATE_SUBMIT_WINDOW_S = 120   # an identical report from the same visitor within this time is treated as an accidental repeat
+
+def submission_fingerprint(location, report_text, photo, audio) -> str:
+    h = hashlib.sha256()
+    for part in ((location or "").strip().lower().encode(), (report_text or "").strip().encode(),
+                 photo.getvalue() if photo is not None else b"", audio[0] if audio is not None else b""):
+        h.update(hashlib.sha256(part).digest())
+    return h.hexdigest()
+
+def recent_submission(fp: str):
+    rec = st.session_state.get("last_submission")
+    return rec if rec and rec["fp"] == fp and time.time() - rec["at"] < DUPLICATE_SUBMIT_WINDOW_S else None
+
 def fmt_time(ts: str) -> str:
     return datetime.fromisoformat(ts).astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
 
@@ -1361,6 +1396,7 @@ with tab_submit:
         H("<div class='sec-title'>Triage assessment</div>"
           "<div class='sec-sub'>AI analysis of the photo, text and voice note appears here.</div>")
         if submit_btn:
+            fp = submission_fingerprint(location, report_text, uploaded_file, audio)
             if uploaded_file is not None and image is None:
                 st.warning("The photo could not be used. Please remove it or upload a different one, or send the report without a photo.")
             elif not location.strip():
@@ -1369,6 +1405,9 @@ with tab_submit:
                 st.warning("Please type a short incident description or record a voice note.")
             elif audio is not None and len(audio[0]) > 15_000_000:
                 st.warning("The voice note is too large. Please keep it under about 2 minutes.")
+            elif (repeat := recent_submission(fp)):   # same visitor, same report, moments ago: do not save or assess it again
+                H(banner("info", "This report was already submitted a moment ago, so it was not sent again. Your tracking code is below."))
+                saved_confirmation(repeat["code"], repeat["coords"], repeat["approx"])
             elif submit_wait() > 0:
                 st.warning(f"You have sent several reports in a short time. Please wait about {submit_wait() // 60 + 1} minute(s) "
                            "before sending another. If someone is in immediate danger, call 112.")
@@ -1390,6 +1429,7 @@ with tab_submit:
                 with st.spinner("Analyzing visual hazards and cross-referencing text..."):
                     try:
                         tracking_code, data, ai_error = intake_report(image, audio, location, report_text, coords)
+                        st.session_state["last_submission"] = dict(fp=fp, code=tracking_code, coords=coords, approx=approx, at=time.time())
                     except Exception as e:
                         st.error(str(e))
 
