@@ -84,7 +84,7 @@ def gen(**kwargs):
 log = logging.getLogger("rahat")   # technical details go to the terminal, not to visitors
 MAX_PHOTO_MB = 10
 MAX_PHOTO_PIXELS = 40_000_000
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"   # gemini-3.8-flash returned 503 (high demand) in a direct test; this model answered one
 MERGE_RADIUS_KM = 25     # reports further apart than this are never matched ...
 MERGE_WINDOW_HOURS = 24  # ... nor reports more than this many hours apart
 MERGE_AUTO_KM = 3        # automatic merge needs reports this close (with precise locations) ...
