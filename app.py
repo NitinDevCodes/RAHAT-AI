@@ -83,6 +83,7 @@ def gen(**kwargs):
 # Same model name you already had working. Change it here only if the API ever says "model not found".
 log = logging.getLogger("rahat")   # technical details go to the terminal, not to visitors
 MAX_PHOTO_MB = 10
+MAX_DESCRIPTION_CHARS = 300   # longest incident description a citizen can send (a voice note can add detail)
 MAX_PHOTO_PIXELS = 40_000_000
 MODEL_NAME = "gemini-3.5-flash-lite"   # gemini-3.8-flash returned 503 (high demand) in a direct test; this model answered one
 MERGE_RADIUS_KM = 25     # reports further apart than this are never matched ...
@@ -1379,7 +1380,7 @@ with tab_submit:
 
         with st.container(border=True):
             H(step_head(3, "What happened", "Type it, speak it, or both. Hindi, English or Hinglish"))
-            report_text = st.text_area("Incident details", label_visibility="collapsed", height=120, max_chars=1500,
+            report_text = st.text_area("Incident details", label_visibility="collapsed", height=120, max_chars=MAX_DESCRIPTION_CHARS,
                                        placeholder="e.g., यहाँ भारी बारिश से पुल टूट गया है और 15 लोग दूसरी तरफ फंसे हैं...")
             H("<div class='or'>or send a voice note</div>")
             recorded = st.audio_input("Record a voice note", label_visibility="collapsed") if hasattr(st, "audio_input") else None
@@ -1403,6 +1404,9 @@ with tab_submit:
                 st.warning("Please enter the incident location.")
             elif not report_text.strip() and audio is None:
                 st.warning("Please type a short incident description or record a voice note.")
+            elif len(report_text.strip()) > MAX_DESCRIPTION_CHARS:   # refuse instead of silently cutting the text
+                st.warning(f"The description is {len(report_text.strip())} characters long. Please shorten it to {MAX_DESCRIPTION_CHARS} "
+                           "characters or fewer (a voice note can carry more detail). Nothing was sent.")
             elif audio is not None and len(audio[0]) > 15_000_000:
                 st.warning("The voice note is too large. Please keep it under about 2 minutes.")
             elif (repeat := recent_submission(fp)):   # same visitor, same report, moments ago: do not save or assess it again
@@ -1413,7 +1417,7 @@ with tab_submit:
                            "before sending another. If someone is in immediate danger, call 112.")
             else:
                 record_submit()
-                location, report_text = location.strip()[:200], report_text.strip()[:1500]
+                location, report_text = location.strip()[:200], report_text.strip()
                 # location -> coordinates (no Gemini involved; failures are handled inside)
                 approx = False
                 if manual_lat != 0.0 or manual_lon != 0.0:
@@ -1672,13 +1676,19 @@ with tab_dash:
                 "Hazard": x["hazard_type"], "Severity": x["severity"], "People": people_label(x["people_count"]),
                 "Reports": x["n_reports"], "Photo check": f"{CRED_ICON.get(cred_of(x), 'ℹ️')} {cred_of(x)}", "Waiting (min)": int(x["minutes"]), "Location": x["location"], "Summary": x["summary"],
             } for i, x in enumerate(visible, start=1)])
-            st.dataframe(table, use_container_width=True, hide_index=True, column_config={
-                "Rank": st.column_config.NumberColumn("Rank", width="small"),
-                "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=float(max(table["Score"].max(), 1)), format="%.1f"),
-                "Severity": st.column_config.NumberColumn("Severity", format="%d / 5", width="small"),
-                "People": st.column_config.TextColumn("People", width="small"),
-                "Reports": st.column_config.NumberColumn("Reports", width="small"),
-                "Summary": st.column_config.TextColumn("Summary", width="large"),
+            st.dataframe(table, use_container_width=True, hide_index=True, column_config={   # pixel widths; the table scrolls sideways if they do not fit
+                "Rank": st.column_config.NumberColumn("Rank", width=60),
+                "Priority": st.column_config.TextColumn("Priority", width=105),
+                "Status": st.column_config.TextColumn("Status", width=105),
+                "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=float(max(table["Score"].max(), 1)), format="%.1f", width=130),
+                "Hazard": st.column_config.TextColumn("Hazard", width=160),
+                "Severity": st.column_config.NumberColumn("Severity", format="%d / 5", width=90),
+                "People": st.column_config.TextColumn("People", width=90),
+                "Reports": st.column_config.NumberColumn("Reports", width=85),
+                "Photo check": st.column_config.TextColumn("Photo check", width=170),
+                "Waiting (min)": st.column_config.NumberColumn("Waiting (min)", format="%d", width=120),
+                "Location": st.column_config.TextColumn("Location", width=250),
+                "Summary": st.column_config.TextColumn("Summary", width=480),
             })
 
             # details, status actions and alert for top 5
